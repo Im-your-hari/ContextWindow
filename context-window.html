@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>How the Context Window Works</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root{
+    --bg:#0B0E14;
+    --panel:#12151F;
+    --panel-2:#161A26;
+    --border:#232B3A;
+    --text:#E6E9EF;
+    --muted:#7C8798;
+    --pinned:#E3A857;
+    --pinned-dim:#5C4A2C;
+    --user:#4FC3B0;
+    --user-dim:#2C4E49;
+    --assistant:#8C93FF;
+    --assistant-dim:#33366B;
+    --evict:#E5654A;
+    --evicted:#39404F;
+  }
+
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;}
+  body{min-height:100vh;display:flex;justify-content:center;padding:28px 16px 40px;}
+
+  .app{width:100%;max-width:760px;}
+
+  header{margin-bottom:22px;}
+  .eyebrow{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--pinned);margin:0 0 8px;}
+  h1{font-size:22px;margin:0 0 8px;font-weight:700;letter-spacing:-0.01em;}
+  .sub{color:var(--muted);font-size:14px;line-height:1.5;margin:0;max-width:560px;}
+
+  /* ---- Token strip: the signature element ---- */
+  .strip-card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 18px 14px;margin-bottom:16px;}
+  .strip-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;flex-wrap:wrap;gap:6px;}
+  .strip-title{font-size:13px;font-weight:600;color:var(--text);}
+  .strip-count{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--muted);}
+  .strip-count b{color:var(--text);font-weight:600;}
+  .strip-count .over{color:var(--evict);}
+
+  .track{
+    display:flex;
+    height:52px;
+    border:1px solid var(--border);
+    border-radius:8px;
+    overflow:hidden;
+    background:
+      repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 24px);
+    position:relative;
+  }
+  .track::after{
+    content:"capacity";
+    position:absolute;right:8px;top:50%;transform:translateY(-50%);
+    font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--muted);opacity:.5;pointer-events:none;
+  }
+  .chip{
+    height:100%;
+    flex-shrink:0;
+    display:flex;align-items:center;justify-content:center;
+    font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;
+    border-right:1px solid rgba(0,0,0,0.35);
+    transition:flex-basis .5s cubic-bezier(.4,0,.2,1), opacity .45s ease, filter .3s ease, transform .45s ease;
+    white-space:nowrap;overflow:hidden;
+  }
+  .chip.pinned{background:linear-gradient(180deg,var(--pinned),#C98A3F);color:#241705;}
+  .chip.user{background:linear-gradient(180deg,var(--user),#37A192);color:#04201C;}
+  .chip.assistant{background:linear-gradient(180deg,var(--assistant),#6E75F0);color:#0E1030;}
+  .chip.evicting{opacity:0;transform:scaleX(0.2);filter:blur(2px);}
+
+  .legend{display:flex;gap:16px;margin-top:12px;flex-wrap:wrap;}
+  .legend-item{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);}
+  .swatch{width:10px;height:10px;border-radius:3px;flex-shrink:0;}
+  .swatch.pinned{background:var(--pinned);}
+  .swatch.user{background:var(--user);}
+  .swatch.assistant{background:var(--assistant);}
+  .swatch.evicted{background:var(--evicted);}
+
+  /* ---- Caption ---- */
+  .caption{
+    min-height:40px;
+    background:var(--panel-2);border:1px solid var(--border);border-radius:10px;
+    padding:10px 14px;font-size:13px;line-height:1.5;color:var(--text);
+    margin-bottom:16px;display:flex;align-items:center;
+  }
+  .caption strong{color:var(--pinned);}
+  .caption .flash{color:var(--evict);font-weight:600;}
+
+  /* ---- Chat log ---- */
+  .log-card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;margin-bottom:18px;}
+  .log-title{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--text);}
+  .log{display:flex;flex-direction:column;gap:8px;max-height:340px;overflow-y:auto;padding-right:4px;}
+  .msg{
+    border:1px solid var(--border);border-radius:10px;padding:9px 12px;
+    font-size:13px;line-height:1.45;
+    opacity:0;transform:translateY(6px);
+    transition:opacity .4s ease, transform .4s ease, border-color .35s ease, background .35s ease;
+    position:relative;
+  }
+  .msg.in{opacity:1;transform:translateY(0);}
+  .msg .role{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:.08em;display:block;margin-bottom:3px;}
+  .msg .tok{position:absolute;top:9px;right:12px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--muted);}
+  .msg.pinned{background:rgba(227,168,87,0.08);border-color:rgba(227,168,87,0.35);}
+  .msg.pinned .role{color:var(--pinned);}
+  .msg.user{background:rgba(79,195,176,0.06);border-color:rgba(79,195,176,0.28);}
+  .msg.user .role{color:var(--user);}
+  .msg.assistant{background:rgba(140,147,255,0.06);border-color:rgba(140,147,255,0.28);}
+  .msg.assistant .role{color:var(--assistant);}
+  .msg.inwindow{box-shadow:0 0 0 1px currentColor inset;}
+  .msg.evicted{opacity:.4;filter:grayscale(0.6);}
+  .msg.evicted .role{color:var(--muted);}
+  .msg .evict-tag{
+    font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--evict);margin-top:4px;display:none;
+  }
+  .msg.evicted .evict-tag{display:block;}
+
+  /* ---- Controls ---- */
+  .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+  button{
+    font-family:'Inter',sans-serif;font-size:13px;font-weight:600;
+    background:var(--panel-2);color:var(--text);border:1px solid var(--border);
+    border-radius:8px;padding:9px 14px;cursor:pointer;transition:background .2s, border-color .2s;
+  }
+  button:hover{background:#1B2130;border-color:#2E3850;}
+  button:focus-visible{outline:2px solid var(--pinned);outline-offset:2px;}
+  button.primary{background:var(--pinned);color:#241705;border-color:var(--pinned);}
+  button.primary:hover{background:#EDB570;}
+  button:disabled{opacity:.4;cursor:not-allowed;}
+  .spacer{flex:1;}
+  .speed-label{font-size:12px;color:var(--muted);font-family:'JetBrains Mono',monospace;}
+
+  @media (max-width:480px){
+    h1{font-size:19px;}
+    .log{max-height:280px;}
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    .chip, .msg{transition:none !important;}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <p class="eyebrow">context window — visualized</p>
+    <h1>The model can only ever see what fits in the window</h1>
+    <p class="sub">Every message costs tokens. Once the window is full, the oldest turns get pushed out to make room for the new one — except anything pinned, like the system prompt, which always stays.</p>
+  </header>
+
+  <div class="strip-card">
+    <div class="strip-head">
+      <span class="strip-title">Context window</span>
+      <span class="strip-count" id="tokenCount"><b>0</b> / 40 tokens</span>
+    </div>
+    <div class="track" id="track"></div>
+    <div class="legend">
+      <div class="legend-item"><span class="swatch pinned"></span>system (pinned)</div>
+      <div class="legend-item"><span class="swatch user"></span>user</div>
+      <div class="legend-item"><span class="swatch assistant"></span>assistant</div>
+      <div class="legend-item"><span class="swatch evicted"></span>evicted</div>
+    </div>
+  </div>
+
+  <div class="caption" id="caption">Press <strong>Play</strong> to start the conversation.</div>
+
+  <div class="log-card">
+    <p class="log-title">Full conversation</p>
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="playBtn">▶ Play</button>
+    <button id="stepBtn">Step →</button>
+    <button id="resetBtn">↺ Reset</button>
+    <div class="spacer"></div>
+    <span class="speed-label">speed</span>
+    <button id="speedBtn">1×</button>
+  </div>
+</div>
+
+<script>
+const CAPACITY = 40;
+const script = [
+  {role:'pinned', label:'system', text:'You are a helpful coding assistant.', tokens:8},
+  {role:'user', label:'user', text:'How do I center a div in CSS?', tokens:7},
+  {role:'assistant', label:'assistant', text:'Use display:flex with justify-content and align-items: center.', tokens:10},
+  {role:'user', label:'user', text:'What about vertically centering text inside a button?', tokens:9},
+  {role:'assistant', label:'assistant', text:'Same idea — flex container, center both axes on the button.', tokens:10},
+  {role:'user', label:'user', text:'Now, how do I do this in a grid layout instead?', tokens:10},
+  {role:'assistant', label:'assistant', text:'Use place-items: center on the grid container.', tokens:8},
+  {role:'user', label:'user', text:'Thanks! Last thing — how do I debug a memory leak in Node?', tokens:12},
+  {role:'assistant', label:'assistant', text:'Take heap snapshots with --inspect and compare growth over time.', tokens:11},
+];
+
+const track = document.getElementById('track');
+const log = document.getElementById('log');
+const caption = document.getElementById('caption');
+const tokenCount = document.getElementById('tokenCount');
+const playBtn = document.getElementById('playBtn');
+const stepBtn = document.getElementById('stepBtn');
+const resetBtn = document.getElementById('resetBtn');
+const speedBtn = document.getElementById('speedBtn');
+
+let idx = 0;          // next message to add
+let window_ = [];     // {step, chipEl, msgEl, tokens}
+let total = 0;
+let playing = false;
+let speeds = [1, 1.75, 0.6];
+let speedIdx = 0;
+let runToken = 0;     // invalidate stale timers on reset
+
+function setCaption(html, flashClass){
+  caption.innerHTML = flashClass ? `<span class="${flashClass}">${html}</span>` : html;
+}
+
+function updateCount(){
+  const over = total > CAPACITY;
+  tokenCount.innerHTML = `<b class="${over?'over':''}">${total}</b> / ${CAPACITY} tokens`;
+}
+
+function delay(ms){
+  const myToken = runToken;
+  return new Promise(res=>{
+    setTimeout(()=>{ if(myToken===runToken) res(); }, ms / speeds[speedIdx]);
+  });
+}
+
+function makeChip(step){
+  const chip = document.createElement('div');
+  chip.className = 'chip ' + step.role;
+  chip.style.flexBasis = (step.tokens * 9) + 'px';
+  chip.textContent = step.tokens + 't';
+  track.appendChild(chip);
+  return chip;
+}
+
+function makeMsgEl(step){
+  const el = document.createElement('div');
+  el.className = 'msg ' + step.role;
+  el.innerHTML = `<span class="role">${step.label}</span><span class="tok">${step.tokens}t</span>${step.text}<div class="evict-tag">evicted — no longer visible to the model</div>`;
+  log.appendChild(el);
+  requestAnimationFrame(()=> el.classList.add('in'));
+  return el;
+}
+
+async function evictOldest(){
+  // find oldest non-pinned entry still in window
+  const target = window_.find(w => w.step.role !== 'pinned');
+  if(!target) return false;
+  setCaption(`Window full — dropping the oldest turn (<strong>${target.step.tokens} tokens</strong>) to make room.`, 'flash');
+  target.chipEl.classList.add('evicting');
+  target.msgEl.classList.remove('inwindow');
+  target.msgEl.classList.add('evicted');
+  total -= target.step.tokens;
+  updateCount();
+  await delay(500);
+  target.chipEl.remove();
+  window_ = window_.filter(w => w !== target);
+  return true;
+}
+
+async function addMessage(){
+  if(idx >= script.length) return false;
+  const step = script[idx++];
+  const chipEl = makeChip(step);
+  const msgEl = makeMsgEl(step);
+  msgEl.classList.add('inwindow');
+  total += step.tokens;
+  window_.push({step, chipEl, msgEl});
+  updateCount();
+
+  if(step.role === 'pinned'){
+    setCaption(`<strong>System prompt</strong> is added first and pinned — it never gets evicted.`);
+  } else {
+    setCaption(`Added a new <strong>${step.label}</strong> turn (${step.tokens} tokens).`);
+  }
+  await delay(650);
+
+  while(total > CAPACITY){
+    const evicted = await evictOldest();
+    if(!evicted) break;
+    await delay(200);
+  }
+  if(total <= CAPACITY){
+    setCaption(`Now showing <strong>${total} / ${CAPACITY}</strong> tokens in the window.`);
+  }
+  await delay(350);
+  return true;
+}
+
+async function playLoop(){
+  playing = true;
+  playBtn.textContent = '⏸ Pause';
+  while(playing && idx < script.length){
+    const more = await addMessage();
+    if(!more) break;
+  }
+  if(idx >= script.length){
+    setCaption(`Conversation finished. Notice the earliest turns were evicted, but the <strong>system prompt</strong> is still in the window.`);
+  }
+  playing = false;
+  playBtn.textContent = '▶ Play';
+}
+
+playBtn.addEventListener('click', ()=>{
+  if(playing){
+    playing = false;
+    playBtn.textContent = '▶ Play';
+  } else if(idx < script.length){
+    playLoop();
+  }
+});
+
+stepBtn.addEventListener('click', async ()=>{
+  if(playing) return;
+  if(idx < script.length){
+    stepBtn.disabled = true;
+    await addMessage();
+    stepBtn.disabled = false;
+  }
+});
+
+resetBtn.addEventListener('click', ()=>{
+  playing = false;
+  runToken++;
+  idx = 0; total = 0; window_ = [];
+  track.innerHTML = '';
+  log.innerHTML = '';
+  playBtn.textContent = '▶ Play';
+  updateCount();
+  setCaption('Press <strong>Play</strong> to start the conversation.');
+});
+
+speedBtn.addEventListener('click', ()=>{
+  speedIdx = (speedIdx + 1) % speeds.length;
+  speedBtn.textContent = speeds[speedIdx] + '×';
+});
+
+updateCount();
+</script>
+</body>
+</html>
